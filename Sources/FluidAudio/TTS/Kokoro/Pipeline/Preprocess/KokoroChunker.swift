@@ -62,6 +62,28 @@ enum KokoroChunker {
             return []
         }
 
+        // Voxnotes F1: build word-keyed override map ONCE so capacity
+        // decisions (mergeShortSentences, tokenCountForSegment,
+        // reassembleFragments) use the same phoneme counts buildChunks
+        // will emit. Lookup prefers exact-case, falls back to normalized.
+        let overridesByWord: [String: TtsPhoneticOverride]
+        if phoneticOverrides.isEmpty {
+            overridesByWord = [:]
+        } else {
+            var map: [String: TtsPhoneticOverride] = [:]
+            map.reserveCapacity(phoneticOverrides.count)
+            for override in phoneticOverrides {
+                // Later duplicates win — matches buildChunks' left-to-right
+                // consumption order for 99% of inputs (same word → same IPA).
+                map[override.word] = override
+                let normalized = normalize(override.word)
+                if !normalized.isEmpty, map[normalized] == nil {
+                    map[normalized] = override
+                }
+            }
+            overridesByWord = map
+        }
+
         let mergedSentences = try await mergeShortSentences(
             refinedSentences,
             lexicon: wordToPhonemes,
@@ -69,7 +91,8 @@ enum KokoroChunker {
             customLexicon: customLexicon,
             allowed: allowedPhonemes,
             capacity: capacity,
-            multilingualLanguage: multilingualLanguage
+            multilingualLanguage: multilingualLanguage,
+            overridesByWord: overridesByWord
         )
 
         let segmentsByPeriods = mergedSentences.isEmpty ? refinedSentences : mergedSentences
@@ -85,7 +108,8 @@ enum KokoroChunker {
                 customLexicon: customLexicon,
                 allowed: allowedPhonemes,
                 capacity: capacity,
-                multilingualLanguage: multilingualLanguage
+                multilingualLanguage: multilingualLanguage,
+                overridesByWord: overridesByWord
             )
 
             if count > capacity {
@@ -97,7 +121,8 @@ enum KokoroChunker {
                     customLexicon: customLexicon,
                     allowed: allowedPhonemes,
                     capacity: capacity,
-                    multilingualLanguage: multilingualLanguage
+                    multilingualLanguage: multilingualLanguage,
+                    overridesByWord: overridesByWord
                 )
                 if !reassembled.isEmpty {
                     segmentsByPunctuations.append(contentsOf: reassembled)
@@ -192,7 +217,8 @@ enum KokoroChunker {
         customLexicon: TtsCustomLexicon?,
         allowed: Set<String>,
         capacity: Int,
-        multilingualLanguage: MultilingualG2PLanguage? = nil
+        multilingualLanguage: MultilingualG2PLanguage? = nil,
+        overridesByWord: [String: TtsPhoneticOverride]? = nil
     ) async throws -> [String] {
         guard !sentences.isEmpty else { return [] }
 
@@ -222,7 +248,8 @@ enum KokoroChunker {
                 customLexicon: customLexicon,
                 allowed: allowed,
                 capacity: capacity,
-                multilingualLanguage: multilingualLanguage
+                multilingualLanguage: multilingualLanguage,
+                overridesByWord: overridesByWord
             )
 
             if sentenceTokens > threshold {
@@ -252,7 +279,8 @@ enum KokoroChunker {
                 customLexicon: customLexicon,
                 allowed: allowed,
                 capacity: capacity,
-                multilingualLanguage: multilingualLanguage
+                multilingualLanguage: multilingualLanguage,
+                overridesByWord: overridesByWord
             )
 
             if candidateTokens <= threshold {
@@ -650,6 +678,12 @@ enum KokoroChunker {
         return resolved
     }
 
+    /// Voxnotes patch (F1): when `overridesByWord` is provided, a matching
+    /// override's IPA token length is used instead of the lexicon/G2P
+    /// resolution for that word. Keeps `tokenCountForSegment`'s budget
+    /// decisions consistent with what `buildChunks` will actually produce,
+    /// eliminating the ~20–30 % divergence reported by the phoneme-budget
+    /// splitter (see `docs/quality/TTS_QUALITY_PLAN_V2.md` critique A1-#3).
     private static func tokenCountForSegment(
         for text: String,
         lexicon: [String: [String]],
@@ -657,7 +691,8 @@ enum KokoroChunker {
         customLexicon: TtsCustomLexicon?,
         allowed: Set<String>,
         capacity: Int,
-        multilingualLanguage: MultilingualG2PLanguage? = nil
+        multilingualLanguage: MultilingualG2PLanguage? = nil,
+        overridesByWord: [String: TtsPhoneticOverride]? = nil
     ) async throws -> Int {
         let atoms = tokenizeAtoms(text)
         guard !atoms.isEmpty else { return 0 }
@@ -673,9 +708,20 @@ enum KokoroChunker {
                 let normalized = normalize(original)
                 guard !normalized.isEmpty else { continue }
 
-                // Check custom lexicon first
+                // Voxnotes F1: phonetic override wins over lexicon when supplied.
                 var phonemes: [String]?
-                if let customLexicon = customLexicon,
+                if let overridesByWord,
+                    let override = overridesByWord[original] ?? overridesByWord[normalized]
+                {
+                    let tokens = resolveOverride(override, allowed: allowed)
+                    if !tokens.isEmpty {
+                        phonemes = tokens
+                    }
+                }
+
+                // Check custom lexicon first (falls through to here when no override match)
+                if phonemes == nil,
+                    let customLexicon = customLexicon,
                     let customPhonemes = customLexicon.phonemes(for: original)
                 {
                     let filtered = customPhonemes.filter { allowed.contains($0) }
@@ -726,7 +772,8 @@ enum KokoroChunker {
         customLexicon: TtsCustomLexicon?,
         allowed: Set<String>,
         capacity: Int,
-        multilingualLanguage: MultilingualG2PLanguage? = nil
+        multilingualLanguage: MultilingualG2PLanguage? = nil,
+        overridesByWord: [String: TtsPhoneticOverride]? = nil
     ) async throws -> [String] {
         guard !fragments.isEmpty else { return [] }
 
@@ -756,7 +803,8 @@ enum KokoroChunker {
                 customLexicon: customLexicon,
                 allowed: allowed,
                 capacity: capacity,
-                multilingualLanguage: multilingualLanguage
+                multilingualLanguage: multilingualLanguage,
+                overridesByWord: overridesByWord
             )
 
             if candidateTokens <= capacity || current.isEmpty {
@@ -771,7 +819,8 @@ enum KokoroChunker {
                     customLexicon: customLexicon,
                     allowed: allowed,
                     capacity: capacity,
-                    multilingualLanguage: multilingualLanguage
+                    multilingualLanguage: multilingualLanguage,
+                    overridesByWord: overridesByWord
                 )
                 if fragmentTokens > capacity {
                     // Fall back to returning empty so caller can handle via chunk builder.
