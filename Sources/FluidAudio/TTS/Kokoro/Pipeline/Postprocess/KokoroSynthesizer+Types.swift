@@ -1,6 +1,21 @@
 import Foundation
 
 extension KokoroSynthesizer {
+    /// Voxnotes patch (F3): controls the global peak-normalization stage
+    /// at the end of `synthesizeDetailed`.
+    ///
+    /// - `.fullDivide` (default): divide every sample by `maxMagnitude`
+    ///   so the programme peak sits at exactly 1.0. Preserves FluidAudio's
+    ///   historical behaviour.
+    /// - `.safetyOnly`: divide only when `maxMagnitude > 1.0`, i.e. pure
+    ///   true-peak clipping avoidance. Leaves FluidAudio's raw dynamics
+    ///   alone so downstream callers (Voxnotes) can own the loudness
+    ///   stage end-to-end.
+    public enum PeakNormalizationMode: Sendable {
+        case fullDivide
+        case safetyOnly
+    }
+
     public struct TokenCapacities {
         public let short: Int
         public let long: Int

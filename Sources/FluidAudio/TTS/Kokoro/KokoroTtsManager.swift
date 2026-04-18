@@ -135,7 +135,8 @@ public final class KokoroTtsManager {
         voiceSpeed: Float = 1.0,
         speakerId: Int = 0,
         variantPreference: ModelNames.TTS.Variant? = nil,
-        deEss: Bool = true
+        deEss: Bool = true,
+        peakNormalization: KokoroSynthesizer.PeakNormalizationMode = .fullDivide
     ) async throws -> KokoroSynthesizer.SynthesisResult {
         guard isInitialized else {
             throw TTSError.modelNotFound("Kokoro model not initialized")
@@ -157,7 +158,8 @@ public final class KokoroTtsManager {
                         voiceSpeed: voiceSpeed,
                         variantPreference: variantPreference,
                         phoneticOverrides: preprocessing.phoneticOverrides,
-                        deEss: deEss
+                        deEss: deEss,
+                        peakNormalization: peakNormalization
                     )
                 }
             }

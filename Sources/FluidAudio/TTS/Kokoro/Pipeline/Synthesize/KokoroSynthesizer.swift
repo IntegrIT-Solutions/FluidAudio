@@ -504,13 +504,20 @@ public struct KokoroSynthesizer {
     }
 
     /// Synthesize audio while returning per-chunk metadata used during inference.
+    ///
+    /// Voxnotes patch (F3): `peakNormalization` selects between full-divide
+    /// (historical default, programme peak = 1.0) and safety-only (divide
+    /// only when peak > 1.0, i.e. true-peak clip avoidance). Voxnotes
+    /// passes `.safetyOnly` so its own LUFS / dialogue leveler stage
+    /// downstream can operate on raw dynamics.
     public static func synthesizeDetailed(
         text: String,
         voice: String = TtsConstants.recommendedVoice,
         voiceSpeed: Float = 1.0,
         variantPreference: ModelNames.TTS.Variant? = nil,
         phoneticOverrides: [TtsPhoneticOverride] = [],
-        deEss: Bool = true
+        deEss: Bool = true,
+        peakNormalization: PeakNormalizationMode = .fullDivide
     ) async throws -> SynthesisResult {
 
         logger.info("Starting synthesis: '\(text)'")
@@ -756,7 +763,18 @@ public struct KokoroSynthesizer {
             vDSP_maxmgv(baseAddress, 1, &maxMagnitude, vDSP_Length(pointer.count))
         }
 
-        if maxMagnitude > 0 {
+        // Voxnotes F3: `.safetyOnly` skips the full-divide when the programme
+        // peak is already at or below 1.0. Avoids chewing per-chunk dynamics
+        // when the downstream owner (Voxnotes) will run its own loudness pass.
+        let shouldDivide: Bool
+        switch peakNormalization {
+        case .fullDivide:
+            shouldDivide = maxMagnitude > 0
+        case .safetyOnly:
+            shouldDivide = maxMagnitude > 1.0
+        }
+
+        if shouldDivide {
             var divisor = maxMagnitude
             allSamples.withUnsafeMutableBufferPointer { destination in
                 guard let destBase = destination.baseAddress else { return }
