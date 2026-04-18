@@ -16,6 +16,34 @@ extension KokoroSynthesizer {
         case safetyOnly
     }
 
+    /// Voxnotes patch (F5): preflight output of `estimateChunks`.
+    /// Lets a caller check ahead of time how FluidAudio will chunk a
+    /// given input text without paying the CoreML inference cost.
+    public struct EstimatedChunk: Sendable {
+        public let index: Int
+        public let text: String
+        public let wordCount: Int
+        public let tokenCount: Int
+        public let pauseAfterMs: Int
+        public let variant: ModelNames.TTS.Variant
+
+        public init(
+            index: Int,
+            text: String,
+            wordCount: Int,
+            tokenCount: Int,
+            pauseAfterMs: Int,
+            variant: ModelNames.TTS.Variant
+        ) {
+            self.index = index
+            self.text = text
+            self.wordCount = wordCount
+            self.tokenCount = tokenCount
+            self.pauseAfterMs = pauseAfterMs
+            self.variant = variant
+        }
+    }
+
     public struct TokenCapacities {
         public let short: Int
         public let long: Int

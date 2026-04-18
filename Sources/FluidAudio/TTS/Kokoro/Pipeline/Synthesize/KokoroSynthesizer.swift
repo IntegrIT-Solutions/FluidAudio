@@ -102,6 +102,71 @@ public struct KokoroSynthesizer {
         )
     }
 
+    /// Voxnotes patch (F5): preflight chunk estimation without running
+    /// the CoreML model. Lets callers verify "this unit will synthesize
+    /// as exactly one chunk" before paying the inference cost.
+    ///
+    /// Runs the same preprocessor + chunker pipeline `synthesizeDetailed`
+    /// uses, then calls `selectVariant` with the provided preference so
+    /// the returned `variant` matches what synthesis will actually pick.
+    ///
+    /// Requires the same context as `synthesizeDetailed` — call through
+    /// `KokoroTtsManager.estimateChunks` or wrap with `withModelCache` /
+    /// `withLexiconAssets` / `withCustomLexicon`.
+    public static func estimateChunks(
+        text: String,
+        voice: String = TtsConstants.recommendedVoice,
+        variantPreference: ModelNames.TTS.Variant? = nil,
+        phoneticOverrides: [TtsPhoneticOverride] = []
+    ) async throws -> [EstimatedChunk] {
+        try await ensureRequiredFiles()
+        if !isVoiceEmbeddingPayloadCached(for: voice) {
+            try? await TtsResourceDownloader.ensureVoiceEmbedding(voice: voice)
+        }
+
+        let language = MultilingualG2PLanguage.fromKokoroVoice(voice)
+        if let language, language != .americanEnglish, language != .britishEnglish {
+            try await MultilingualG2PModel.shared.ensureModelsAvailable()
+        }
+
+        // We need the model cache for `capacities` only; model weights aren't
+        // loaded for estimation because we never call the predictor.
+        try await loadModel(variant: variantPreference)
+
+        try await loadSimplePhonemeDictionary()
+        try await validateTextHasDictionaryCoverage(text)
+
+        let vocabulary = try await KokoroVocabulary.shared.getVocabulary()
+        let capacities = try await capacities(for: variantPreference)
+
+        let chunks = try await chunkText(
+            text,
+            voice: voice,
+            vocabulary: vocabulary,
+            longVariantTokenBudget: capacities.long,
+            phoneticOverrides: phoneticOverrides
+        )
+        guard !chunks.isEmpty else { return [] }
+
+        let entries = try buildChunkEntries(
+            from: chunks,
+            vocabulary: vocabulary,
+            preference: variantPreference,
+            capacities: capacities
+        )
+
+        return entries.map { entry in
+            EstimatedChunk(
+                index: entry.template.index,
+                text: entry.template.text,
+                wordCount: entry.template.wordCount,
+                tokenCount: entry.template.tokenCount,
+                pauseAfterMs: entry.template.pauseAfterMs,
+                variant: entry.template.variant
+            )
+        }
+    }
+
     private static func buildChunkEntries(
         from chunks: [TextChunk],
         vocabulary: [String: Int32],

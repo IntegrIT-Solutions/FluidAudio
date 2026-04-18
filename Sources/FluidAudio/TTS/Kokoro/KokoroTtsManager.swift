@@ -166,6 +166,41 @@ public final class KokoroTtsManager {
         }
     }
 
+    /// Voxnotes patch (F5): preflight chunk estimation without synthesis.
+    /// Runs the text preprocessor + chunker and returns how FluidAudio
+    /// will segment this input, so callers can verify a splitter decision
+    /// *before* paying the CoreML inference cost.
+    public func estimateChunks(
+        text: String,
+        voice: String? = nil,
+        speakerId: Int = 0,
+        variantPreference: ModelNames.TTS.Variant? = nil
+    ) async throws -> [KokoroSynthesizer.EstimatedChunk] {
+        guard isInitialized else {
+            throw TTSError.modelNotFound("Kokoro model not initialized")
+        }
+
+        try await prepareLexiconAssetsIfNeeded()
+
+        let preprocessing = TtsTextPreprocessor.preprocessDetailed(text)
+        let cleanedText = try KokoroSynthesizer.sanitizeInput(preprocessing.text)
+        let selectedVoice = resolveVoice(voice, speakerId: speakerId)
+        try await ensureVoiceEmbeddingIfNeeded(for: selectedVoice)
+
+        return try await KokoroSynthesizer.withLexiconAssets(lexiconAssets) {
+            try await KokoroSynthesizer.withModelCache(modelCache) {
+                try await KokoroSynthesizer.withCustomLexicon(customLexicon) {
+                    try await KokoroSynthesizer.estimateChunks(
+                        text: cleanedText,
+                        voice: selectedVoice,
+                        variantPreference: variantPreference,
+                        phoneticOverrides: preprocessing.phoneticOverrides
+                    )
+                }
+            }
+        }
+    }
+
     public func synthesizeToFile(
         text: String,
         outputURL: URL,
