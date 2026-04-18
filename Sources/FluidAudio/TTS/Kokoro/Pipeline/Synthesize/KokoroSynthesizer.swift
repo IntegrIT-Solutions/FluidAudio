@@ -250,13 +250,17 @@ public struct KokoroSynthesizer {
     }
 
     /// Synthesize a single chunk of text using precomputed token IDs.
+    ///
+    /// Voxnotes patch (F2): return value gained `predictedSamples` so callers
+    /// can observe where pred_dur and the raw audio output length disagree
+    /// (i.e. the CoreML model self-truncated).
     private static func synthesizeChunk(
         _ chunk: TextChunk,
         inputIds: [Int32],
         variant: ModelNames.TTS.Variant,
         targetTokens: Int,
         referenceVector: [Float]
-    ) async throws -> ([Float], TimeInterval) {
+    ) async throws -> ([Float], TimeInterval, Int) {
         guard !inputIds.isEmpty else {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
         }
@@ -413,6 +417,10 @@ public struct KokoroSynthesizer {
 
         // Compute audio length from pred_dur (model's audio_length_samples output is broken)
         var effectiveCount = audioArrayUnwrapped.count
+        // Voxnotes patch (F2): capture pred_dur sample count and propagate up so
+        // the Voxnotes-side truncation-detection path can compare it against
+        // `samples.count` to flag real tail truncations.
+        var predictedSampleCount = 0
 
         if let predDurArray = output.featureValue(for: "pred_dur")?.multiArrayValue {
             // Sum pred_dur to get total frames
@@ -425,6 +433,7 @@ public struct KokoroSynthesizer {
             // Convert frames to samples: frames * 600 samples/frame
             let predictedSamples = Int(round(totalFrames * 600.0))
             if predictedSamples > 0 {
+                predictedSampleCount = predictedSamples
                 effectiveCount = min(predictedSamples, audioArrayUnwrapped.count)
             }
         }
@@ -468,7 +477,7 @@ public struct KokoroSynthesizer {
         }
 
         await recycleModelArrays()
-        return (samples, predictionTime)
+        return (samples, predictionTime, predictedSampleCount)
     }
 
     /// Main synthesis function returning audio bytes only.
@@ -556,6 +565,9 @@ public struct KokoroSynthesizer {
             let index: Int
             let samples: [Float]
             let predictionTime: TimeInterval
+            /// Voxnotes F2: what pred_dur said the sample count should be
+            /// (unclamped by the raw audio length). Zero when unavailable.
+            let predictedSampleCount: Int
         }
 
         let embeddingDimension = try await modelCache.referenceEmbeddingDimension()
@@ -617,7 +629,7 @@ public struct KokoroSynthesizer {
                     Self.logger.info("Chunk \(chunkIndex + 1) text: '\(template.text)'")
                     Self.logger.info(
                         "Chunk \(chunkIndex + 1) using Kokoro \(variantDescription(template.variant)) model")
-                    let (chunkSamples, predictionTime) = try await synthesizeChunk(
+                    let (chunkSamples, predictionTime, predictedSamples) = try await synthesizeChunk(
                         chunk,
                         inputIds: inputIds,
                         variant: template.variant,
@@ -626,7 +638,8 @@ public struct KokoroSynthesizer {
                     return ChunkSynthesisResult(
                         index: chunkIndex,
                         samples: chunkSamples,
-                        predictionTime: predictionTime)
+                        predictionTime: predictionTime,
+                        predictedSampleCount: predictedSamples)
                 }
             }
 
@@ -781,6 +794,11 @@ public struct KokoroSynthesizer {
             sampleRate: Double(TtsConstants.audioSampleRate)
         )
 
+        // Voxnotes F2: look up each chunk's predicted sample count (unclamped)
+        // so `ChunkInfo.predictedSampleCount` reflects what pred_dur claimed.
+        let predictedByIndex: [Int: Int] = Dictionary(
+            uniqueKeysWithValues: sortedOutputs.map { ($0.index, $0.predictedSampleCount) }
+        )
         let chunkInfos = zip(chunkTemplates, chunkSampleBuffers).map { template, samples in
             ChunkInfo(
                 index: template.index,
@@ -791,7 +809,8 @@ public struct KokoroSynthesizer {
                 pauseAfterMs: template.pauseAfterMs,
                 tokenCount: template.tokenCount,
                 samples: samples,
-                variant: template.variant
+                variant: template.variant,
+                predictedSampleCount: predictedByIndex[template.index] ?? 0
             )
         }
 
@@ -829,6 +848,9 @@ public struct KokoroSynthesizer {
 
         let adjustedChunks = baseResult.chunks.map { chunk -> ChunkInfo in
             let stretched = adjustSamples(chunk.samples, factor: factor)
+            // Voxnotes F2: pred_dur measured the unstretched length; scale it
+            // by `factor` to match the stretched sample count.
+            let adjustedPredicted = Int(round(Double(chunk.predictedSampleCount) / Double(factor)))
             return ChunkInfo(
                 index: chunk.index,
                 text: chunk.text,
@@ -838,7 +860,8 @@ public struct KokoroSynthesizer {
                 pauseAfterMs: chunk.pauseAfterMs,
                 tokenCount: chunk.tokenCount,
                 samples: stretched,
-                variant: chunk.variant
+                variant: chunk.variant,
+                predictedSampleCount: adjustedPredicted
             )
         }
 

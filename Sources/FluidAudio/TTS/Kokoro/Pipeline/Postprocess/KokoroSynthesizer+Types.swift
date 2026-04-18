@@ -56,6 +56,14 @@ extension KokoroSynthesizer {
         public let samples: [Float]
         public let variant: ModelNames.TTS.Variant
 
+        /// Voxnotes patch (F2): duration-predictor output summed × 600 samples/frame.
+        /// This is the sample count Kokoro's duration predictor claimed it would emit.
+        /// `samples.count` is `min(predictedSampleCount, raw CoreML audio output length)`.
+        /// When `samples.count < predictedSampleCount`, the model self-truncated — a
+        /// strong signal of tail-truncation we can diagnose post-hoc.
+        /// Zero if pred_dur was unavailable (older model variants).
+        public let predictedSampleCount: Int
+
         public init(
             index: Int,
             text: String,
@@ -65,7 +73,8 @@ extension KokoroSynthesizer {
             pauseAfterMs: Int,
             tokenCount: Int,
             samples: [Float],
-            variant: ModelNames.TTS.Variant
+            variant: ModelNames.TTS.Variant,
+            predictedSampleCount: Int = 0
         ) {
             self.index = index
             self.text = text
@@ -76,6 +85,7 @@ extension KokoroSynthesizer {
             self.tokenCount = tokenCount
             self.samples = samples
             self.variant = variant
+            self.predictedSampleCount = predictedSampleCount
         }
     }
 
