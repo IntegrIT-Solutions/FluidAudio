@@ -14,6 +14,63 @@ public struct KokoroSynthesizer {
     static let lexiconCache = LexiconCache()
     static let multiArrayPool = MultiArrayPool()
 
+    // MARK: - Voxnotes fork overrides (F6 / F7b / F7c)
+
+    /// Voxnotes F6: per-call ref_s row override for Lever C dual-render
+    /// seam crossfade.
+    ///
+    /// When `nil` (default), each chunk's `ref_s` is looked up at
+    /// `voices[inputIds.count]` — Kokoro's standard length-conditioned
+    /// style selection.
+    ///
+    /// When set inside a `KokoroSynthesizer.$referenceTokenCountOverride
+    /// .withValue(N) { ... }` scope, the lookup is forced to
+    /// `voices[N]` for every chunk in the enclosed synthesis call.
+    ///
+    /// Voxnotes-side use case: render the leading ~50 phonemes of unit
+    /// N a SECOND time using the prior unit's token-count style, then
+    /// equal-power crossfade with unit N's natural rendering. The
+    /// listener never hears the abrupt timbre change at the unit seam.
+    /// See `voxnotes/docs/quality/LEVER_C_DESIGN.md`.
+    ///
+    /// TaskLocal is async-safe: the override only affects synthesis
+    /// calls made inside the `withValue` block; concurrent renders
+    /// outside the block see `nil`.
+    @TaskLocal public static var referenceTokenCountOverride: Int? = nil
+
+    /// Voxnotes F7b: per-call prosody-half override for the cross-unit
+    /// EMA prosody blend.
+    ///
+    /// When set inside a `KokoroSynthesizer.$referenceProsodyHalfOverride
+    /// .withValue(...)` scope, the chunk-render loop replaces
+    /// `ref_s[timbreHalf..<dim]` with the override AFTER the natural
+    /// length-conditioned lookup. The timbre half (`ref_s[0..<timbreHalf]`)
+    /// is left untouched, so voice identity stays stable while the
+    /// duration/predictor style slides to the caller's blended vector.
+    /// Length-mismatched overrides are dropped + logged. Orthogonal to
+    /// F6 (token-count override).
+    /// See `voxnotes/docs/quality/LEVER_PROSODY_DESIGN.md`.
+    @TaskLocal public static var referenceProsodyHalfOverride: [Float]? = nil
+
+    /// Voxnotes F7c: per-token pred_dur lower bound override.
+    ///
+    /// When set, after the model emits `pred_dur` (a [1, targetTokens]
+    /// tensor of per-token frame counts), each entry is clamped UP to
+    /// `floorFrames`. The final summed `totalFrames` (used for
+    /// `audio_length_samples`) is recomputed from the clamped vector.
+    ///
+    /// Voxnotes-side use case: when the previous unit rendered at
+    /// 75 ms/phoneme but the current short unit is predicted at 55
+    /// ms/phoneme, set the floor to ~70 ms / 6.0 ms-per-frame ≈ 11
+    /// frames to prevent the dictionary-read compression. Higher than
+    /// the F7b prosody-half blend because we're directly enforcing
+    /// minimum duration without disturbing F0 prediction.
+    ///
+    /// Cap suggestion: <= prevUnit_meanFramesPerToken × 0.85 — never
+    /// stretch beyond 85% of the prior unit's pace, otherwise short
+    /// utterances start sounding artificially slow.
+    @TaskLocal public static var perTokenPredDurFloorFrames: Float? = nil
+
     private enum Context {
         @TaskLocal static var modelCache: KokoroModelCache?
         @TaskLocal static var lexiconAssets: LexiconAssetManager?
@@ -325,7 +382,7 @@ public struct KokoroSynthesizer {
         variant: ModelNames.TTS.Variant,
         targetTokens: Int,
         referenceVector: [Float]
-    ) async throws -> ([Float], TimeInterval, Int) {
+    ) async throws -> ([Float], TimeInterval, Int, [Float]?) {
         guard !inputIds.isEmpty else {
             throw TTSError.processingFailed("No input IDs generated for chunk: \(chunk.words.joined(separator: " "))")
         }
@@ -486,12 +543,24 @@ public struct KokoroSynthesizer {
         // the Voxnotes-side truncation-detection path can compare it against
         // `samples.count` to flag real tail truncations.
         var predictedSampleCount = 0
+        // Voxnotes F7a: capture the raw per-token frame counts so callers can
+        // compute frames-per-token statistics (F7c duration anchor basis).
+        var predictedDurations: [Float]?
 
         if let predDurArray = output.featureValue(for: "pred_dur")?.multiArrayValue {
             // Sum pred_dur to get total frames
             var totalFrames: Float = 0.0
             let predDurPtr = predDurArray.dataPointer.bindMemory(to: Float.self, capacity: predDurArray.count)
+            // Voxnotes F7c: clamp each per-token frame count UP to the
+            // caller's floor before summing, so the recomputed
+            // `predictedSamples` reflects the clamped vector. In-place
+            // mutation is safe: the tensor is freshly produced by this
+            // synth call and not shared or cached.
+            let floor = KokoroSynthesizer.perTokenPredDurFloorFrames ?? 0
             for i in 0..<predDurArray.count {
+                if floor > 0 && predDurPtr[i] < floor {
+                    predDurPtr[i] = floor
+                }
                 totalFrames += predDurPtr[i]
             }
 
@@ -501,6 +570,10 @@ public struct KokoroSynthesizer {
                 predictedSampleCount = predictedSamples
                 effectiveCount = min(predictedSamples, audioArrayUnwrapped.count)
             }
+            // Voxnotes F7a: snapshot the (possibly F7c-clamped) per-token
+            // frame counts for the ChunkInfo round-trip.
+            predictedDurations = Array(
+                UnsafeBufferPointer(start: predDurPtr, count: predDurArray.count))
         }
 
         if variant == .fiveSecond {
@@ -542,7 +615,7 @@ public struct KokoroSynthesizer {
         }
 
         await recycleModelArrays()
-        return (samples, predictionTime, predictedSampleCount)
+        return (samples, predictionTime, predictedSampleCount, predictedDurations)
     }
 
     /// Main synthesis function returning audio bytes only.
@@ -640,6 +713,8 @@ public struct KokoroSynthesizer {
             /// Voxnotes F2: what pred_dur said the sample count should be
             /// (unclamped by the raw audio length). Zero when unavailable.
             let predictedSampleCount: Int
+            /// Voxnotes F7a: raw per-token pred_dur frame counts.
+            let predictedDurations: [Float]?
         }
 
         let embeddingDimension = try await modelCache.referenceEmbeddingDimension()
@@ -689,19 +764,27 @@ public struct KokoroSynthesizer {
                 let inputIds = entry.inputIds
                 let template = entry.template
                 let chunkIndex = index
-                guard let embeddingData = embeddingCache[inputIds.count] else {
+                // Voxnotes F6: when an override is active, look up the
+                // override's ref_s row instead of the chunk's own
+                // length. The override count was added to
+                // `prepareVoiceEmbeddingCache`'s uniqueCounts, so the
+                // lookup is guaranteed to find a value.
+                let lookupCount = KokoroSynthesizer.referenceTokenCountOverride ?? inputIds.count
+                guard let embeddingData = embeddingCache[lookupCount] else {
                     throw TTSError.processingFailed(
-                        "Missing voice embedding for chunk \(index + 1) with \(inputIds.count) tokens"
+                        "Missing voice embedding for chunk \(index + 1) with \(lookupCount) tokens (override=\(KokoroSynthesizer.referenceTokenCountOverride as Any))"
                     )
                 }
-                let referenceVector = embeddingData.vector
+                // Voxnotes F7b: splice the caller's prosody-half override
+                // over the naturally looked-up ref_s (timbre half kept).
+                let referenceVector = Self.applyingProsodyHalfOverride(to: embeddingData.vector)
                 group.addTask(priority: .userInitiated) {
                     Self.logger.info(
                         "Processing chunk \(chunkIndex + 1)/\(totalChunks): \(chunk.words.count) words")
                     Self.logger.info("Chunk \(chunkIndex + 1) text: '\(template.text)'")
                     Self.logger.info(
                         "Chunk \(chunkIndex + 1) using Kokoro \(variantDescription(template.variant)) model")
-                    let (chunkSamples, predictionTime, predictedSamples) = try await synthesizeChunk(
+                    let (chunkSamples, predictionTime, predictedSamples, predictedDurations) = try await synthesizeChunk(
                         chunk,
                         inputIds: inputIds,
                         variant: template.variant,
@@ -711,7 +794,8 @@ public struct KokoroSynthesizer {
                         index: chunkIndex,
                         samples: chunkSamples,
                         predictionTime: predictionTime,
-                        predictedSampleCount: predictedSamples)
+                        predictedSampleCount: predictedSamples,
+                        predictedDurations: predictedDurations)
                 }
             }
 
@@ -882,6 +966,12 @@ public struct KokoroSynthesizer {
         let predictedByIndex: [Int: Int] = Dictionary(
             uniqueKeysWithValues: sortedOutputs.map { ($0.index, $0.predictedSampleCount) }
         )
+        // Voxnotes F7a: same lookup for the raw per-token frame counts.
+        let durationsByIndex: [Int: [Float]] = Dictionary(
+            uniqueKeysWithValues: sortedOutputs.compactMap { output in
+                output.predictedDurations.map { (output.index, $0) }
+            }
+        )
         let chunkInfos = zip(chunkTemplates, chunkSampleBuffers).map { template, samples in
             ChunkInfo(
                 index: template.index,
@@ -893,7 +983,8 @@ public struct KokoroSynthesizer {
                 tokenCount: template.tokenCount,
                 samples: samples,
                 variant: template.variant,
-                predictedSampleCount: predictedByIndex[template.index] ?? 0
+                predictedSampleCount: predictedByIndex[template.index] ?? 0,
+                predictedDurations: durationsByIndex[template.index]
             )
         }
 
@@ -934,6 +1025,10 @@ public struct KokoroSynthesizer {
             // Voxnotes F2: pred_dur measured the unstretched length; scale it
             // by `factor` to match the stretched sample count.
             let adjustedPredicted = Int(round(Double(chunk.predictedSampleCount) / Double(factor)))
+            // Voxnotes F7a: frame counts scale with the same stretch factor.
+            let adjustedDurations = chunk.predictedDurations.map { durations in
+                durations.map { $0 / factor }
+            }
             return ChunkInfo(
                 index: chunk.index,
                 text: chunk.text,
@@ -944,7 +1039,8 @@ public struct KokoroSynthesizer {
                 tokenCount: chunk.tokenCount,
                 samples: stretched,
                 variant: chunk.variant,
-                predictedSampleCount: adjustedPredicted
+                predictedSampleCount: adjustedPredicted,
+                predictedDurations: adjustedDurations
             )
         }
 

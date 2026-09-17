@@ -228,7 +228,14 @@ extension KokoroSynthesizer {
         entries: [ChunkEntry],
         embeddingDimension: Int
     ) throws -> [Int: VoiceEmbeddingData] {
-        let uniqueCounts = Set(entries.map { $0.inputIds.count })
+        var uniqueCounts = Set(entries.map { $0.inputIds.count })
+        // Voxnotes F6: include the override count if set. Without this,
+        // a Lever C seam render that overrides to a count not present
+        // in the input chunks would fail the embeddingCache lookup at
+        // synthesis time.
+        if let override = KokoroSynthesizer.referenceTokenCountOverride {
+            uniqueCounts.insert(override)
+        }
         var cache: [Int: VoiceEmbeddingData] = [:]
         cache.reserveCapacity(uniqueCounts.count)
 
@@ -266,6 +273,46 @@ extension KokoroSynthesizer {
         }
 
         return embedding
+    }
+
+    /// Voxnotes patch (F7b helper): public lookup of the natural `ref_s`
+    /// vector for a voice at a given phoneme count, so callers can compute
+    /// the cross-unit prosody blend without re-implementing the voice JSON
+    /// parser. See `voxnotes/docs/quality/LEVER_PROSODY_DESIGN.md`.
+    public static func referenceVector(
+        voice: String,
+        phonemeCount: Int
+    ) async throws -> [Float] {
+        let cache = try currentModelCache()
+        let expectedDimension = try await cache.referenceEmbeddingDimension()
+        let data = try fetchVoiceEmbeddingData(
+            voice: voice,
+            phonemeCount: phonemeCount,
+            expectedDimension: expectedDimension
+        )
+        return data.vector
+    }
+
+    /// Voxnotes patch (F7b): splice `referenceProsodyHalfOverride` over the
+    /// prosody half (`ref_s[timbreHalf..<dim]`) of a naturally looked-up
+    /// vector. The timbre half is left untouched so voice identity stays
+    /// stable. Length-mismatched overrides are dropped + logged.
+    static func applyingProsodyHalfOverride(to vector: [Float]) -> [Float] {
+        guard let override = KokoroSynthesizer.referenceProsodyHalfOverride else {
+            return vector
+        }
+        let dim = vector.count
+        let timbreHalf = dim / 2
+        let expected = dim - timbreHalf
+        guard override.count == expected else {
+            Self.logger.warning(
+                "Dropping referenceProsodyHalfOverride with mismatched length (expected \(expected), got \(override.count))"
+            )
+            return vector
+        }
+        var spliced = vector
+        spliced.replaceSubrange(timbreHalf..<dim, with: override)
+        return spliced
     }
 
     internal static func refDim(from model: MLModel) -> Int {

@@ -201,6 +201,34 @@ public final class KokoroTtsManager {
         }
     }
 
+    /// Voxnotes patch (F7b manager wrapper): public lookup of the natural
+    /// `ref_s` vector for a voice at a given phoneme count, wrapped in this
+    /// manager's model-cache + lexicon-assets context so callers don't need
+    /// to thread those contexts. Backs the cross-unit prosody blend in
+    /// `voxnotes/Voxnotes/Sources/TTS/KokoroEngine.swift`.
+    public func referenceVector(
+        voice: String,
+        phonemeCount: Int
+    ) async throws -> [Float] {
+        guard isInitialized else {
+            throw TTSError.modelNotFound("Kokoro model not initialized")
+        }
+
+        try await prepareLexiconAssetsIfNeeded()
+
+        let selectedVoice = resolveVoice(voice, speakerId: defaultSpeakerId)
+        try await ensureVoiceEmbeddingIfNeeded(for: selectedVoice)
+
+        return try await KokoroSynthesizer.withLexiconAssets(lexiconAssets) {
+            try await KokoroSynthesizer.withModelCache(modelCache) {
+                try await KokoroSynthesizer.referenceVector(
+                    voice: selectedVoice,
+                    phonemeCount: phonemeCount
+                )
+            }
+        }
+    }
+
     public func synthesizeToFile(
         text: String,
         outputURL: URL,

@@ -107,6 +107,14 @@ extension KokoroSynthesizer {
         /// Zero if pred_dur was unavailable (older model variants).
         public let predictedSampleCount: Int
 
+        /// Voxnotes patch (F7a): the raw per-token frame counts from the
+        /// duration predictor (`pred_dur`), one entry per input token, in
+        /// the units of `TtsConstants.kokoroFrameSamples`. Callers can
+        /// compute per-unit frames-per-token statistics (the F7c
+        /// duration-anchor basis) without re-running the model. `nil` when
+        /// pred_dur was unavailable.
+        public let predictedDurations: [Float]?
+
         public init(
             index: Int,
             text: String,
@@ -117,7 +125,8 @@ extension KokoroSynthesizer {
             tokenCount: Int,
             samples: [Float],
             variant: ModelNames.TTS.Variant,
-            predictedSampleCount: Int = 0
+            predictedSampleCount: Int = 0,
+            predictedDurations: [Float]? = nil
         ) {
             self.index = index
             self.text = text
@@ -129,6 +138,7 @@ extension KokoroSynthesizer {
             self.samples = samples
             self.variant = variant
             self.predictedSampleCount = predictedSampleCount
+            self.predictedDurations = predictedDurations
         }
     }
 
